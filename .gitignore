@@ -1,0 +1,28 @@
+# ROS2 build artifacts
+ros_ws/build/
+ros_ws/install/
+ros_ws/log/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
+
+# Data / models / logs
+data/
+models/
+*.pt
+*.pth
+*.onnx
+*.engine
+*.safetensors
+*.bin
+
+# Misc
+*.log
