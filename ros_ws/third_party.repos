@@ -1,0 +1,9 @@
+repositories:
+  vision_msgs:
+    type: git
+    url: https://github.com/ros-perception/vision_msgs.git
+    version: humble
+  v4l2_camera:
+    type: git
+    url: https://github.com/ros-drivers/v4l2_camera.git
+    version: humble
