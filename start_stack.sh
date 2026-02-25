@@ -121,6 +121,7 @@ start_bg "orchestrator" "${LOG_DIR}/orchestrator.log" \
     -p det_topic:=/yolo/detections_json \
     -p moondream_url:="http://127.0.0.1:${MOONDREAM_PORT}/caption" \
     -p moondream_hz:=1.0
+    -p moondream_enabled:=true
 
 echo ""
 echo "===== STACK STARTED SUCCESSFULLY ====="

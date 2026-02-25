@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-
 import time
 import json
 import threading
 from dataclasses import dataclass
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union, Dict
 
 import cv2
 import numpy as np
@@ -15,8 +14,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
 
-
-WIN_NAME = "Orchestrator (YOLO overlay + moondream)"
+WIN_NAME = "Orchestrator (YOLO overlay + VLM)"
 
 
 @dataclass
@@ -46,14 +44,39 @@ def resize_max_width(img_bgr: np.ndarray, max_w: int) -> np.ndarray:
     h, w = img_bgr.shape[:2]
     if w <= max_w:
         return img_bgr
-    new_h = int(h * (max_w / float(w)))
-    new_h = max(1, new_h)
+    new_h = max(1, int(h * (max_w / float(w))))
     return cv2.resize(img_bgr, (max_w, new_h), interpolation=cv2.INTER_AREA)
+
+
+def iou(a: Det, b: Det) -> float:
+    xA = max(a.x1, b.x1)
+    yA = max(a.y1, b.y1)
+    xB = min(a.x2, b.x2)
+    yB = min(a.y2, b.y2)
+    inter = max(0, xB - xA) * max(0, yB - yA)
+    if inter <= 0:
+        return 0.0
+    areaA = max(0, a.x2 - a.x1) * max(0, a.y2 - a.y1)
+    areaB = max(0, b.x2 - b.x1) * max(0, b.y2 - b.y1)
+    denom = float(areaA + areaB - inter)
+    return inter / denom if denom > 0 else 0.0
+
+
+def det_key(d: Det, frame_w: int, frame_h: int) -> Tuple:
+    """
+    Coarse identity key so jitter doesn’t generate “new targets” every frame.
+    Quantize center into 10x10 grid.
+    """
+    cx = (d.x1 + d.x2) // 2
+    cy = (d.y1 + d.y2) // 2
+    qx = int(cx / max(1, frame_w) * 10)  # 0..9
+    qy = int(cy / max(1, frame_h) * 10)  # 0..9
+    return (str(d.cls), qx, qy)
 
 
 class Orchestrator(Node):
     def __init__(self):
-        super().__init__("orchestrator")
+        super().__init__("orchestrator_node")
 
         # ---------------- Params ----------------
         self.declare_parameter("image_topic", "/image")
@@ -63,8 +86,9 @@ class Orchestrator(Node):
         self.declare_parameter("choose_best_only", True)
         self.declare_parameter("crop_pad_px", 0)
         self.declare_parameter("max_crop_width", 640)
+        self.declare_parameter("jpeg_quality", 85)
 
-        # moondream
+        # Preferred params (moondream)
         self.declare_parameter("moondream_enabled", True)
         self.declare_parameter("moondream_url", "http://127.0.0.1:8001/caption")
         self.declare_parameter("moondream_prompt", "Describe the person briefly.")
@@ -73,10 +97,25 @@ class Orchestrator(Node):
         self.declare_parameter("moondream_max_new_tokens", 80)
         self.declare_parameter("moondream_temperature", 0.2)
 
+        # Backward-compat params (molmo_*)
+        self.declare_parameter("molmo_enabled", True)
+        self.declare_parameter("molmo_url", "http://127.0.0.1:8001/caption")
+        self.declare_parameter("molmo_prompt", "Describe the person briefly.")
+        self.declare_parameter("molmo_hz", 1.0)
+        self.declare_parameter("molmo_timeout_s", 12.0)
+        self.declare_parameter("molmo_max_new_tokens", 80)
+        self.declare_parameter("molmo_temperature", 0.2)
+
         # Output
         self.declare_parameter("publish_annotated", True)
         self.declare_parameter("show_window", True)
         self.declare_parameter("render_hz", 30.0)
+
+        # ---- NEW overload guards ----
+        self.declare_parameter("vlm_target_cooldown_s", 8.0)   # same target recaption cooldown
+        self.declare_parameter("vlm_stable_required_s", 0.5)   # must be stable this long before caption
+        self.declare_parameter("vlm_iou_stable_thresh", 0.6)   # IoU threshold to consider same target
+        self.declare_parameter("overlay_hz_cap", 15.0)         # 0 = no cap; else draw overlay at most this rate
 
         # ---------------- Read params ----------------
         self.image_topic = str(self.get_parameter("image_topic").value)
@@ -86,14 +125,7 @@ class Orchestrator(Node):
         self.choose_best_only = bool(self.get_parameter("choose_best_only").value)
         self.crop_pad_px = int(self.get_parameter("crop_pad_px").value)
         self.max_crop_width = int(self.get_parameter("max_crop_width").value)
-
-        self.moondream_enabled = bool(self.get_parameter("moondream_enabled").value)
-        self.moondream_url = str(self.get_parameter("moondream_url").value)
-        self.moondream_prompt = str(self.get_parameter("moondream_prompt").value)
-        self.moondream_hz = float(self.get_parameter("moondream_hz").value)
-        self.moondream_timeout_s = float(self.get_parameter("moondream_timeout_s").value)
-        self.moondream_max_new_tokens = int(self.get_parameter("moondream_max_new_tokens").value)
-        self.moondream_temperature = float(self.get_parameter("moondream_temperature").value)
+        self.jpeg_quality = int(self.get_parameter("jpeg_quality").value)
 
         self.publish_annotated = bool(self.get_parameter("publish_annotated").value)
         self.show_window = bool(self.get_parameter("show_window").value)
@@ -101,24 +133,59 @@ class Orchestrator(Node):
         render_hz = float(self.get_parameter("render_hz").value)
         self.render_dt = 1.0 / max(1e-6, render_hz)
 
+        self.vlm_target_cooldown_s = float(self.get_parameter("vlm_target_cooldown_s").value)
+        self.vlm_stable_required_s = float(self.get_parameter("vlm_stable_required_s").value)
+        self.vlm_iou_stable_thresh = float(self.get_parameter("vlm_iou_stable_thresh").value)
+        overlay_hz_cap = float(self.get_parameter("overlay_hz_cap").value)
+        self._overlay_min_dt = 0.0 if overlay_hz_cap <= 0 else (1.0 / max(1e-6, overlay_hz_cap))
+
+        # ---------------- VLM param aliasing ----------------
+        def p(name: str):
+            return self.get_parameter(name).value
+
+        md_url = str(p("moondream_url"))
+        mm_url = str(p("molmo_url"))
+        md_enabled = bool(p("moondream_enabled"))
+        mm_enabled = bool(p("molmo_enabled"))
+
+        self.vlm_enabled = md_enabled or mm_enabled
+
+        md_default = "http://127.0.0.1:8001/caption"
+        use_molmo_url = (md_url == md_default and mm_url != md_default)
+        self.vlm_url = mm_url if use_molmo_url else md_url
+
+        def choose_str(md_name, md_def, mm_name):
+            mdv = str(p(md_name))
+            mmv = str(p(mm_name))
+            return mmv if (mdv == md_def and mmv != md_def) else mdv
+
+        def choose_float(md_name, md_def, mm_name):
+            mdv = float(p(md_name))
+            mmv = float(p(mm_name))
+            return mmv if (abs(mdv - md_def) < 1e-9 and abs(mmv - md_def) > 1e-9) else mdv
+
+        def choose_int(md_name, md_def, mm_name):
+            mdv = int(p(md_name))
+            mmv = int(p(mm_name))
+            return mmv if (mdv == md_def and mmv != md_def) else mdv
+
+        self.vlm_prompt = choose_str("moondream_prompt", "Describe the person briefly.", "molmo_prompt")
+        self.vlm_hz = choose_float("moondream_hz", 1.0, "molmo_hz")
+        self.vlm_timeout_s = choose_float("moondream_timeout_s", 12.0, "molmo_timeout_s")
+        self.vlm_max_new_tokens = choose_int("moondream_max_new_tokens", 80, "molmo_max_new_tokens")
+        self.vlm_temperature = choose_float("moondream_temperature", 0.2, "molmo_temperature")
+
         # ---------------- State ----------------
         self.bridge = CvBridge()
         self.last_frame: Optional[np.ndarray] = None
         self.last_dets_raw: Optional[Any] = None
-        self.last_dets_time: float = 0.0
 
-        # VLM state (protected by lock)
         self._vlm_lock = threading.Lock()
-        self.last_moondream_call_t: float = 0.0
-        self.last_moondream_state: str = "IDLE"
-        self.last_moondream_text: str = ""
-        self.last_moondream_ms: Optional[float] = None
+        self.last_call_t: float = 0.0
+        self.last_state: str = "IDLE"
+        self.last_text: str = ""
+        self.last_ms: Optional[float] = None
 
-        # For spam control
-        self._prev_logged_state: Optional[str] = None
-        self._prev_logged_text: str = ""
-
-        # Shutdown handling
         self._shutdown_requested = False
 
         # Worker thread / queue (latest crop wins)
@@ -127,9 +194,15 @@ class Orchestrator(Node):
         self._worker_stop = threading.Event()
         self._inflight = False
 
-        # ---------------- Window Setup ----------------
+        # ---- NEW: stable-target gating + cooldown map ----
+        self._stable_det: Optional[Det] = None
+        self._stable_since: Optional[float] = None
+        self._last_caption_by_key: Dict[Tuple, float] = {}
+        self._last_overlay_draw_t: float = 0.0
+
+        # ---------------- Window Setup (ONCE) ----------------
         if self.show_window:
-            cv2.namedWindow(WIN_NAME, cv2.WINDOW_NORMAL)  # resizable
+            cv2.namedWindow(WIN_NAME, cv2.WINDOW_NORMAL)
             cv2.resizeWindow(WIN_NAME, 960, 540)
 
         # ---------------- ROS I/O ----------------
@@ -140,43 +213,33 @@ class Orchestrator(Node):
         if self.publish_annotated:
             self.pub_annot = self.create_publisher(Image, "/image_annotated", 10)
 
-        # VLM debug topics
+        # Debug topics
         self.pub_vlm_caption = self.create_publisher(String, "/vlm/caption", 10)
         self.pub_vlm_latency = self.create_publisher(String, "/vlm/latency_ms", 10)
+        self.pub_vlm_state = self.create_publisher(String, "/vlm/state", 10)
 
-        # Timer for rendering ONLY
+        # Timer for rendering
         self.timer = self.create_timer(self.render_dt, self.on_timer)
 
         # Start worker
-        self._worker = threading.Thread(target=self._moondream_worker, daemon=True)
+        self._worker = threading.Thread(target=self._vlm_worker, daemon=True)
         self._worker.start()
 
-        # Ensure cleanup on ROS shutdown
         rclpy.get_default_context().on_shutdown(self._on_ros_shutdown)
 
         self.get_logger().info("Orchestrator started")
-        self.get_logger().info(f"  image_topic     : {self.image_topic}")
-        self.get_logger().info(f"  det_topic       : {self.det_topic}")
-        self.get_logger().info(f"  moondream_url   : {self.moondream_url} (enabled={self.moondream_enabled})")
+        self.get_logger().info(f"  image_topic: {self.image_topic}")
+        self.get_logger().info(f"  det_topic  : {self.det_topic}")
+        self.get_logger().info(f"  vlm_url    : {self.vlm_url} (enabled={self.vlm_enabled})")
+        self.get_logger().info(
+            f"  guards     : hz={self.vlm_hz}, stable={self.vlm_stable_required_s}s, "
+            f"iou>={self.vlm_iou_stable_thresh}, cooldown={self.vlm_target_cooldown_s}s, overlay_cap_dt={self._overlay_min_dt:.3f}s"
+        )
 
     # ---------------- Shutdown ----------------
-    def request_shutdown(self) -> None:
-        if self._shutdown_requested:
-            return
-        self._shutdown_requested = True
-        try:
-            self.get_logger().info("Shutdown requested")
-        except Exception:
-            pass
-        try:
-            rclpy.shutdown()
-        except Exception:
-            pass
-
     def _on_ros_shutdown(self) -> None:
-        # Called when rclpy is shutting down
         self._worker_stop.set()
-        self._crop_event.set()  # wake worker
+        self._crop_event.set()
         try:
             if self.show_window:
                 cv2.destroyAllWindows()
@@ -185,7 +248,6 @@ class Orchestrator(Node):
             pass
 
     def destroy_node(self):
-        # Ensure worker stops + join
         self._worker_stop.set()
         self._crop_event.set()
         try:
@@ -205,7 +267,6 @@ class Orchestrator(Node):
     def on_dets(self, msg: String) -> None:
         try:
             self.last_dets_raw = json.loads(msg.data)
-            self.last_dets_time = time.time()
         except Exception as e:
             self.get_logger().warn(f"Detections JSON parse failed: {e}")
 
@@ -233,6 +294,9 @@ class Orchestrator(Node):
                 continue
 
             cls = d.get("class", d.get("cls", d.get("class_id", "person")))
+            # If your YOLO publishes non-person classes, you can filter here:
+            # if str(cls) != "person": continue
+
             box = d.get("box") or d.get("bbox") or d.get("xyxy")
             xywh = d.get("xywh")
 
@@ -269,8 +333,27 @@ class Orchestrator(Node):
             return [out[0]]
         return out
 
-    # ---------------- Overlay ----------------
+    # ---------------- Overlay helpers ----------------
+    def _put_multiline(self, frame: np.ndarray, text: str, x: int, y: int, max_chars: int = 80, max_lines: int = 4):
+        msg = (text or "").strip().replace("\n", " ")
+        if not msg:
+            return
+        msg = msg[: max_chars * max_lines]
+        lines = [msg[i:i + max_chars] for i in range(0, len(msg), max_chars)]
+        lines = lines[:max_lines]
+        yy = y
+        for line in lines:
+            cv2.putText(frame, line, (x, yy), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                        (255, 255, 255), 2, cv2.LINE_AA)
+            yy += 20
+
     def draw_overlay(self, frame: np.ndarray, dets: List[Det]) -> None:
+        # Optional overlay cap to reduce CPU/GPU draw load
+        now = time.time()
+        if self._overlay_min_dt > 0 and (now - self._last_overlay_draw_t) < self._overlay_min_dt:
+            return
+        self._last_overlay_draw_t = now
+
         for d in dets:
             cv2.rectangle(frame, (d.x1, d.y1), (d.x2, d.y2), (0, 255, 0), 2)
             label = f"person {d.conf:.2f}"
@@ -281,22 +364,17 @@ class Orchestrator(Node):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2, cv2.LINE_AA)
 
         with self._vlm_lock:
-            state = self.last_moondream_state
-            ms = self.last_moondream_ms
-            text = self.last_moondream_text
+            state = self.last_state
+            ms = self.last_ms
+            text = self.last_text
 
-        status = f"moondream: {state}"
+        status = f"vlm: {state}"
         if ms is not None:
             status += f" {ms:.0f}ms"
         cv2.putText(frame, status, (10, 25),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
 
-        if text:
-            msg = text.strip().replace("\n", " ")
-            if len(msg) > 90:
-                msg = msg[:87] + "..."
-            cv2.putText(frame, msg, (10, 55),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+        self._put_multiline(frame, text, 10, 55)
 
     # ---------------- Crop ----------------
     def crop_from_det(self, frame: np.ndarray, det: Det) -> np.ndarray:
@@ -310,39 +388,72 @@ class Orchestrator(Node):
             return frame.copy()
         return frame[y1:y2, x1:x2].copy()
 
-    # ---------------- moondream scheduling ----------------
-    def should_call_moondream(self) -> bool:
-        if not self.moondream_enabled:
-            return False
-        if self.moondream_hz <= 0:
+    # ---------------- VLM scheduling ----------------
+    def should_call_vlm_global(self) -> bool:
+        """Global rate limit: (vlm_hz)."""
+        if not self.vlm_enabled or self.vlm_hz <= 0:
             return False
         now = time.time()
         with self._vlm_lock:
-            last_t = self.last_moondream_call_t
-        return (now - last_t) >= (1.0 / self.moondream_hz)
+            last_t = self.last_call_t
+        return (now - last_t) >= (1.0 / self.vlm_hz)
 
-    def _publish_vlm_debug(self, text: str, ms: Optional[float]) -> None:
-        msg = String()
-        msg.data = text or ""
-        self.pub_vlm_caption.publish(msg)
+    def _publish_vlm_debug(self, state: str, text: str, ms: Optional[float]) -> None:
+        self.pub_vlm_state.publish(String(data=state or ""))
+        self.pub_vlm_caption.publish(String(data=text or ""))
+        self.pub_vlm_latency.publish(String(data="" if ms is None else f"{ms:.1f}"))
 
-        lat = String()
-        lat.data = "" if ms is None else f"{ms:.1f}"
-        self.pub_vlm_latency.publish(lat)
-
-    def enqueue_crop_for_moondream(self, crop_bgr: np.ndarray) -> None:
-        # latest-crop-wins
+    def enqueue_crop(self, crop_bgr: np.ndarray) -> None:
+        # latest crop wins; avoid queue growth
         self._latest_crop = crop_bgr
         self._crop_event.set()
 
-    def _moondream_worker(self) -> None:
+    def _update_stable_target(self, best: Det) -> Tuple[bool, Tuple]:
+        """
+        Returns (stable_ok, key_for_cooldown).
+        Stability is based on IoU consistency for vlm_stable_required_s seconds.
+        """
+        now = time.time()
+
+        if self._stable_det is None:
+            self._stable_det = best
+            self._stable_since = now
+        else:
+            if iou(self._stable_det, best) >= self.vlm_iou_stable_thresh:
+                # keep stable window
+                pass
+            else:
+                self._stable_det = best
+                self._stable_since = now
+
+        if self.last_frame is None or self._stable_det is None:
+            return (False, ("none", 0, 0))
+
+        h, w = self.last_frame.shape[:2]
+        key = det_key(self._stable_det, w, h)
+
+        stable_ok = (self._stable_since is not None) and ((now - self._stable_since) >= self.vlm_stable_required_s)
+        return stable_ok, key
+
+    def _target_off_cooldown(self, key: Tuple) -> bool:
+        now = time.time()
+        last = self._last_caption_by_key.get(key, 0.0)
+        return (now - last) >= self.vlm_target_cooldown_s
+
+    def _mark_captioned(self, key: Tuple) -> None:
+        self._last_caption_by_key[key] = time.time()
+        # small cleanup so dict doesn’t grow forever
+        if len(self._last_caption_by_key) > 200:
+            cutoff = time.time() - max(30.0, self.vlm_target_cooldown_s * 3.0)
+            self._last_caption_by_key = {k: t for k, t in self._last_caption_by_key.items() if t >= cutoff}
+
+    def _vlm_worker(self) -> None:
         session = requests.Session()
 
         while not self._worker_stop.is_set():
             self._crop_event.wait(timeout=0.2)
             if self._worker_stop.is_set():
                 break
-
             if not self._crop_event.is_set():
                 continue
             self._crop_event.clear()
@@ -352,118 +463,125 @@ class Orchestrator(Node):
             if crop is None:
                 continue
 
-            # prevent overlapping calls
+            # One in-flight request max
             if self._inflight:
                 continue
             self._inflight = True
 
-            # mark pending
             with self._vlm_lock:
-                self.last_moondream_call_t = time.time()
-                self.last_moondream_state = "PENDING"
-                self.last_moondream_text = ""
-                self.last_moondream_ms = None
+                self.last_call_t = time.time()
+                self.last_state = "PENDING"
+                self.last_text = ""
+                self.last_ms = None
+            self._publish_vlm_debug("PENDING", "", None)
 
             t0 = time.time()
             try:
                 crop = resize_max_width(crop, self.max_crop_width)
-                jpeg_bytes = bgr_to_jpeg_bytes(crop, quality=85)
+                jpeg_bytes = bgr_to_jpeg_bytes(crop, quality=self.jpeg_quality)
 
                 files = {"image": ("crop.jpg", jpeg_bytes, "image/jpeg")}
                 data = {
-                    "prompt": self.moondream_prompt,
-                    "max_new_tokens": str(self.moondream_max_new_tokens),
-                    "temperature": str(self.moondream_temperature),
+                    "prompt": self.vlm_prompt,
+                    "max_new_tokens": str(self.vlm_max_new_tokens),
+                    "temperature": str(self.vlm_temperature),
                 }
 
-                r = session.post(
-                    self.moondream_url,
-                    files=files,
-                    data=data,
-                    timeout=self.moondream_timeout_s,
-                )
+                r = session.post(self.vlm_url, files=files, data=data, timeout=self.vlm_timeout_s)
                 ms = (time.time() - t0) * 1000.0
 
                 if r.status_code != 200:
-                    text = (r.text or "").strip()[:160]
+                    text = (r.text or "").strip()[:600]
+                    state = f"HTTP_{r.status_code}"
                     with self._vlm_lock:
-                        self.last_moondream_state = f"ERROR({r.status_code})"
-                        self.last_moondream_text = text
-                        self.last_moondream_ms = ms
-                    self._publish_vlm_debug(text, ms)
+                        self.last_state = state
+                        self.last_text = text
+                        self.last_ms = ms
+                    self._publish_vlm_debug(state, text, ms)
                     continue
 
-                j = r.json()
-                text = str(j.get("text", ""))[:500]
+                try:
+                    j = r.json()
+                except Exception as e:
+                    text = f"JSON_PARSE_ERROR: {e} | body={(r.text or '')[:200]}"
+                    with self._vlm_lock:
+                        self.last_state = "JSON_ERROR"
+                        self.last_text = text[:600]
+                        self.last_ms = ms
+                    self._publish_vlm_debug("JSON_ERROR", text[:600], ms)
+                    continue
+
+                text = str(j.get("text", j.get("caption", "")))[:600]
+
                 with self._vlm_lock:
-                    self.last_moondream_state = "OK"
-                    self.last_moondream_text = text
-                    self.last_moondream_ms = ms
-
-                self._publish_vlm_debug(text, ms)
-
-                txt_one_line = text.strip().replace("\n", " ")
-                if txt_one_line and txt_one_line != self._prev_logged_text:
-                    self.get_logger().info(f"[VLM] {ms:.0f} ms | {txt_one_line}")
-                    self._prev_logged_text = txt_one_line
+                    self.last_state = "OK"
+                    self.last_text = text
+                    self.last_ms = ms
+                self._publish_vlm_debug("OK", text, ms)
 
             except requests.Timeout:
                 ms = (time.time() - t0) * 1000.0
                 with self._vlm_lock:
-                    self.last_moondream_state = "TIMEOUT"
-                    self.last_moondream_text = ""
-                    self.last_moondream_ms = ms
-                self._publish_vlm_debug("", ms)
+                    self.last_state = "TIMEOUT"
+                    self.last_text = ""
+                    self.last_ms = ms
+                self._publish_vlm_debug("TIMEOUT", "", ms)
 
             except Exception as e:
                 ms = (time.time() - t0) * 1000.0
+                text = str(e)[:600]
                 with self._vlm_lock:
-                    self.last_moondream_state = "ERROR"
-                    self.last_moondream_text = str(e)[:160]
-                    self.last_moondream_ms = ms
-                self._publish_vlm_debug(str(e)[:160], ms)
+                    self.last_state = "ERROR"
+                    self.last_text = text
+                    self.last_ms = ms
+                self._publish_vlm_debug("ERROR", text, ms)
 
             finally:
                 self._inflight = False
 
     # ---------------- Main loop ----------------
     def on_timer(self) -> None:
-        if self._shutdown_requested:
-            return
-        if self.last_frame is None:
+        if self._shutdown_requested or self.last_frame is None:
             return
 
         frame = self.last_frame.copy()
         h, w = frame.shape[:2]
         dets = self.parse_person_dets(self.last_dets_raw, (h, w))
 
-        # Decide whether to enqueue a crop (non-blocking)
-        if dets and self.should_call_moondream():
-            crop = self.crop_from_det(self.last_frame, dets[0])
-            if crop.shape[0] >= 32 and crop.shape[1] >= 32:
-                self.enqueue_crop_for_moondream(crop)
-            else:
-                with self._vlm_lock:
-                    self.last_moondream_state = "SKIP(tiny_crop)"
-                    self.last_moondream_text = ""
-                    self.last_moondream_ms = None
-        elif not dets:
-            with self._vlm_lock:
-                # Don't spam flip-flopping; just show state if nothing else is happening
-                if self.last_moondream_state.startswith("PENDING"):
-                    pass
+        if dets:
+            best = dets[0]
+            stable_ok, key = self._update_stable_target(best)
+
+            can_call = (
+                stable_ok and
+                self.should_call_vlm_global() and
+                self._target_off_cooldown(key) and
+                (not self._inflight)
+            )
+
+            if can_call:
+                crop = self.crop_from_det(self.last_frame, best)
+                if crop.shape[0] >= 32 and crop.shape[1] >= 32:
+                    self._mark_captioned(key)  # mark early to prevent burst spam
+                    self.enqueue_crop(crop)
                 else:
-                    self.last_moondream_state = "SKIP(no_person)"
-                    self.last_moondream_text = ""
-                    self.last_moondream_ms = None
+                    with self._vlm_lock:
+                        self.last_state = "SKIP_TINY"
+                        self.last_text = ""
+                        self.last_ms = None
+                    self._publish_vlm_debug("SKIP_TINY", "", None)
 
-        # State change log (minimal spam)
-        with self._vlm_lock:
-            state = self.last_moondream_state
-        if state != self._prev_logged_state:
-            self.get_logger().info(f"[VLM STATE] {state}")
-            self._prev_logged_state = state
+        else:
+            # reset stable target window when nothing detected
+            self._stable_det = None
+            self._stable_since = None
+            with self._vlm_lock:
+                if not self.last_state.startswith("PENDING"):
+                    self.last_state = "SKIP_NO_PERSON"
+                    self.last_text = ""
+                    self.last_ms = None
 
+        # Overlay + output
         self.draw_overlay(frame, dets)
 
         if self.publish_annotated and self.pub_annot is not None:
@@ -472,27 +590,16 @@ class Orchestrator(Node):
                 self.pub_annot.publish(msg)
             except Exception as e:
                 self.get_logger().error(f"publish /image_annotated failed: {e}")
-                
-        if self.show_window:
-            try:
-		cv2.destroyWindow(WIN_NAME)  # in case it was created before with AUTOSIZE
-	    except Exception:
-		pass
-
-	    cv2.namedWindow(WIN_NAME, cv2.WINDOW_NORMAL)  # ONLY this flag
-	    cv2.resizeWindow(WIN_NAME, 960, 540)
-
-	    # Force autosize OFF (some backends ignore it, but try)
-	    try:
-		cv2.setWindowProperty(WIN_NAME, cv2.WND_PROP_AUTOSIZE, 0)
-	    except Exception:
-		pass
 
         if self.show_window:
             cv2.imshow(WIN_NAME, frame)
             key = cv2.waitKey(1) & 0xFF
-            if key == ord("q") or key == 27:  # q or ESC
-                self.request_shutdown()
+            if key in (ord("q"), 27):
+                self._shutdown_requested = True
+                try:
+                    rclpy.shutdown()
+                except Exception:
+                    pass
 
 
 def main():
@@ -510,7 +617,6 @@ def main():
             cv2.waitKey(1)
         except Exception:
             pass
-        # Only shutdown if not already
         if rclpy.ok():
             rclpy.shutdown()
 
