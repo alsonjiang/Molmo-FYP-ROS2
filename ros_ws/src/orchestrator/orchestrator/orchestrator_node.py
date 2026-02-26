@@ -63,14 +63,10 @@ def iou(a: Det, b: Det) -> float:
 
 
 def det_key(d: Det, frame_w: int, frame_h: int) -> Tuple:
-    """
-    Coarse identity key so jitter doesn’t generate “new targets” every frame.
-    Quantize center into 10x10 grid.
-    """
     cx = (d.x1 + d.x2) // 2
     cy = (d.y1 + d.y2) // 2
-    qx = int(cx / max(1, frame_w) * 10)  # 0..9
-    qy = int(cy / max(1, frame_h) * 10)  # 0..9
+    qx = int(cx / max(1, frame_w) * 10)
+    qy = int(cy / max(1, frame_h) * 10)
     return (str(d.cls), qx, qy)
 
 
@@ -111,11 +107,17 @@ class Orchestrator(Node):
         self.declare_parameter("show_window", True)
         self.declare_parameter("render_hz", 30.0)
 
-        # ---- NEW overload guards ----
-        self.declare_parameter("vlm_target_cooldown_s", 8.0)   # same target recaption cooldown
-        self.declare_parameter("vlm_stable_required_s", 0.5)   # must be stable this long before caption
-        self.declare_parameter("vlm_iou_stable_thresh", 0.6)   # IoU threshold to consider same target
-        self.declare_parameter("overlay_hz_cap", 15.0)         # 0 = no cap; else draw overlay at most this rate
+        # overload guards
+        self.declare_parameter("vlm_target_cooldown_s", 8.0)
+        self.declare_parameter("vlm_stable_required_s", 0.5)
+        self.declare_parameter("vlm_iou_stable_thresh", 0.6)
+
+        # terminal caption printing
+        self.declare_parameter("caption_to_terminal", True)
+        self.declare_parameter("caption_print_min_interval_s", 0.8)
+
+        # overlay behavior
+        self.declare_parameter("overlay_show_pending", True)  # show state= PENDING etc.
 
         # ---------------- Read params ----------------
         self.image_topic = str(self.get_parameter("image_topic").value)
@@ -136,8 +138,11 @@ class Orchestrator(Node):
         self.vlm_target_cooldown_s = float(self.get_parameter("vlm_target_cooldown_s").value)
         self.vlm_stable_required_s = float(self.get_parameter("vlm_stable_required_s").value)
         self.vlm_iou_stable_thresh = float(self.get_parameter("vlm_iou_stable_thresh").value)
-        overlay_hz_cap = float(self.get_parameter("overlay_hz_cap").value)
-        self._overlay_min_dt = 0.0 if overlay_hz_cap <= 0 else (1.0 / max(1e-6, overlay_hz_cap))
+
+        self.caption_to_terminal = bool(self.get_parameter("caption_to_terminal").value)
+        self.caption_print_min_interval_s = float(self.get_parameter("caption_print_min_interval_s").value)
+
+        self.overlay_show_pending = bool(self.get_parameter("overlay_show_pending").value)
 
         # ---------------- VLM param aliasing ----------------
         def p(name: str):
@@ -183,7 +188,8 @@ class Orchestrator(Node):
         self._vlm_lock = threading.Lock()
         self.last_call_t: float = 0.0
         self.last_state: str = "IDLE"
-        self.last_text: str = ""
+        self.last_text: str = ""        # debug topic
+        self.last_text_ok: str = ""     # overlay text (sticky)
         self.last_ms: Optional[float] = None
 
         self._shutdown_requested = False
@@ -194,11 +200,14 @@ class Orchestrator(Node):
         self._worker_stop = threading.Event()
         self._inflight = False
 
-        # ---- NEW: stable-target gating + cooldown map ----
+        # stable-target gating + cooldown map
         self._stable_det: Optional[Det] = None
         self._stable_since: Optional[float] = None
         self._last_caption_by_key: Dict[Tuple, float] = {}
-        self._last_overlay_draw_t: float = 0.0
+
+        # terminal print throttling
+        self._last_printed_text: str = ""
+        self._last_print_t: float = 0.0
 
         # ---------------- Window Setup (ONCE) ----------------
         if self.show_window:
@@ -218,10 +227,8 @@ class Orchestrator(Node):
         self.pub_vlm_latency = self.create_publisher(String, "/vlm/latency_ms", 10)
         self.pub_vlm_state = self.create_publisher(String, "/vlm/state", 10)
 
-        # Timer for rendering
         self.timer = self.create_timer(self.render_dt, self.on_timer)
 
-        # Start worker
         self._worker = threading.Thread(target=self._vlm_worker, daemon=True)
         self._worker.start()
 
@@ -231,10 +238,6 @@ class Orchestrator(Node):
         self.get_logger().info(f"  image_topic: {self.image_topic}")
         self.get_logger().info(f"  det_topic  : {self.det_topic}")
         self.get_logger().info(f"  vlm_url    : {self.vlm_url} (enabled={self.vlm_enabled})")
-        self.get_logger().info(
-            f"  guards     : hz={self.vlm_hz}, stable={self.vlm_stable_required_s}s, "
-            f"iou>={self.vlm_iou_stable_thresh}, cooldown={self.vlm_target_cooldown_s}s, overlay_cap_dt={self._overlay_min_dt:.3f}s"
-        )
 
     # ---------------- Shutdown ----------------
     def _on_ros_shutdown(self) -> None:
@@ -294,8 +297,6 @@ class Orchestrator(Node):
                 continue
 
             cls = d.get("class", d.get("cls", d.get("class_id", "person")))
-            # If your YOLO publishes non-person classes, you can filter here:
-            # if str(cls) != "person": continue
 
             box = d.get("box") or d.get("bbox") or d.get("xyxy")
             xywh = d.get("xywh")
@@ -312,7 +313,6 @@ class Orchestrator(Node):
 
             x1f, y1f, x2f, y2f = float(x1), float(y1), float(x2), float(y2)
 
-            # normalized coords
             if 0.0 <= x1f <= 1.0 and 0.0 <= x2f <= 1.0 and 0.0 <= y1f <= 1.0 and 0.0 <= y2f <= 1.0:
                 x1i, x2i = int(x1f * w), int(x2f * w)
                 y1i, y2i = int(y1f * h), int(y2f * h)
@@ -334,26 +334,42 @@ class Orchestrator(Node):
         return out
 
     # ---------------- Overlay helpers ----------------
-    def _put_multiline(self, frame: np.ndarray, text: str, x: int, y: int, max_chars: int = 80, max_lines: int = 4):
+    def _wrap_lines(self, text: str, max_chars: int = 80, max_lines: int = 4) -> List[str]:
         msg = (text or "").strip().replace("\n", " ")
         if not msg:
-            return
+            return []
         msg = msg[: max_chars * max_lines]
         lines = [msg[i:i + max_chars] for i in range(0, len(msg), max_chars)]
-        lines = lines[:max_lines]
-        yy = y
-        for line in lines:
-            cv2.putText(frame, line, (x, yy), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
-                        (255, 255, 255), 2, cv2.LINE_AA)
-            yy += 20
+        return lines[:max_lines]
+
+    def _draw_text_panel(self, frame: np.ndarray, lines: List[str], x: int, y: int) -> None:
+        if not lines:
+            return
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = 0.55
+        thickness = 2
+        line_h = 20
+
+        # Measure panel size
+        widths = []
+        for ln in lines:
+            (tw, th), base = cv2.getTextSize(ln, font, scale, thickness)
+            widths.append(tw)
+        panel_w = max(widths) + 16
+        panel_h = len(lines) * line_h + 12
+
+        # Background rectangle (solid) to prevent “ghosting/flicker” look
+        x2 = min(frame.shape[1] - 1, x + panel_w)
+        y2 = min(frame.shape[0] - 1, y + panel_h)
+        cv2.rectangle(frame, (x, y), (x2, y2), (0, 0, 0), -1)
+
+        # Draw lines
+        yy = y + 22
+        for ln in lines:
+            cv2.putText(frame, ln, (x + 8, yy), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
+            yy += line_h
 
     def draw_overlay(self, frame: np.ndarray, dets: List[Det]) -> None:
-        # Optional overlay cap to reduce CPU/GPU draw load
-        now = time.time()
-        if self._overlay_min_dt > 0 and (now - self._last_overlay_draw_t) < self._overlay_min_dt:
-            return
-        self._last_overlay_draw_t = now
-
         for d in dets:
             cv2.rectangle(frame, (d.x1, d.y1), (d.x2, d.y2), (0, 255, 0), 2)
             label = f"person {d.conf:.2f}"
@@ -366,15 +382,22 @@ class Orchestrator(Node):
         with self._vlm_lock:
             state = self.last_state
             ms = self.last_ms
-            text = self.last_text
+            caption = self.last_text_ok  # sticky caption only (stable)
 
+        # Build panel lines (status always shown; caption shown if we have one)
         status = f"vlm: {state}"
         if ms is not None:
             status += f" {ms:.0f}ms"
-        cv2.putText(frame, status, (10, 25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
 
-        self._put_multiline(frame, text, 10, 55)
+        lines = [status]
+        if caption:
+            lines += self._wrap_lines(caption, max_chars=80, max_lines=4)
+
+        # Optionally hide status during pending (caption stays)
+        if not self.overlay_show_pending and state.startswith("PENDING"):
+            lines = self._wrap_lines(caption, max_chars=80, max_lines=4)
+
+        self._draw_text_panel(frame, lines, x=8, y=8)
 
     # ---------------- Crop ----------------
     def crop_from_det(self, frame: np.ndarray, det: Det) -> np.ndarray:
@@ -390,7 +413,6 @@ class Orchestrator(Node):
 
     # ---------------- VLM scheduling ----------------
     def should_call_vlm_global(self) -> bool:
-        """Global rate limit: (vlm_hz)."""
         if not self.vlm_enabled or self.vlm_hz <= 0:
             return False
         now = time.time()
@@ -404,25 +426,17 @@ class Orchestrator(Node):
         self.pub_vlm_latency.publish(String(data="" if ms is None else f"{ms:.1f}"))
 
     def enqueue_crop(self, crop_bgr: np.ndarray) -> None:
-        # latest crop wins; avoid queue growth
         self._latest_crop = crop_bgr
         self._crop_event.set()
 
     def _update_stable_target(self, best: Det) -> Tuple[bool, Tuple]:
-        """
-        Returns (stable_ok, key_for_cooldown).
-        Stability is based on IoU consistency for vlm_stable_required_s seconds.
-        """
         now = time.time()
 
         if self._stable_det is None:
             self._stable_det = best
             self._stable_since = now
         else:
-            if iou(self._stable_det, best) >= self.vlm_iou_stable_thresh:
-                # keep stable window
-                pass
-            else:
+            if iou(self._stable_det, best) < self.vlm_iou_stable_thresh:
                 self._stable_det = best
                 self._stable_since = now
 
@@ -442,10 +456,24 @@ class Orchestrator(Node):
 
     def _mark_captioned(self, key: Tuple) -> None:
         self._last_caption_by_key[key] = time.time()
-        # small cleanup so dict doesn’t grow forever
         if len(self._last_caption_by_key) > 200:
             cutoff = time.time() - max(30.0, self.vlm_target_cooldown_s * 3.0)
             self._last_caption_by_key = {k: t for k, t in self._last_caption_by_key.items() if t >= cutoff}
+
+    def _maybe_print_caption(self, text: str) -> None:
+        if not self.caption_to_terminal:
+            return
+        t = (text or "").strip()
+        if not t:
+            return
+        now = time.time()
+        if t == self._last_printed_text:
+            return
+        if (now - self._last_print_t) < max(0.0, self.caption_print_min_interval_s):
+            return
+        self._last_printed_text = t
+        self._last_print_t = now
+        self.get_logger().info(f"[VLM] {t}")
 
     def _vlm_worker(self) -> None:
         session = requests.Session()
@@ -463,15 +491,15 @@ class Orchestrator(Node):
             if crop is None:
                 continue
 
-            # One in-flight request max
             if self._inflight:
                 continue
             self._inflight = True
 
+            # IMPORTANT: do NOT blank last_text_ok (sticky caption)
             with self._vlm_lock:
                 self.last_call_t = time.time()
                 self.last_state = "PENDING"
-                self.last_text = ""
+                self.last_text = ""   # debug can be blank
                 self.last_ms = None
             self._publish_vlm_debug("PENDING", "", None)
 
@@ -511,13 +539,19 @@ class Orchestrator(Node):
                     self._publish_vlm_debug("JSON_ERROR", text[:600], ms)
                     continue
 
-                text = str(j.get("text", j.get("caption", "")))[:600]
+                text = str(j.get("text", j.get("caption", "")))[:600].strip()
 
                 with self._vlm_lock:
                     self.last_state = "OK"
                     self.last_text = text
+                    # CRITICAL: only update sticky caption if non-empty
+                    if text:
+                        self.last_text_ok = text
                     self.last_ms = ms
                 self._publish_vlm_debug("OK", text, ms)
+
+                if text:
+                    self._maybe_print_caption(text)
 
             except requests.Timeout:
                 ms = (time.time() - t0) * 1000.0
@@ -562,7 +596,7 @@ class Orchestrator(Node):
             if can_call:
                 crop = self.crop_from_det(self.last_frame, best)
                 if crop.shape[0] >= 32 and crop.shape[1] >= 32:
-                    self._mark_captioned(key)  # mark early to prevent burst spam
+                    self._mark_captioned(key)
                     self.enqueue_crop(crop)
                 else:
                     with self._vlm_lock:
@@ -572,7 +606,6 @@ class Orchestrator(Node):
                     self._publish_vlm_debug("SKIP_TINY", "", None)
 
         else:
-            # reset stable target window when nothing detected
             self._stable_det = None
             self._stable_since = None
             with self._vlm_lock:
@@ -581,7 +614,6 @@ class Orchestrator(Node):
                     self.last_text = ""
                     self.last_ms = None
 
-        # Overlay + output
         self.draw_overlay(frame, dets)
 
         if self.publish_annotated and self.pub_annot is not None:
@@ -593,8 +625,8 @@ class Orchestrator(Node):
 
         if self.show_window:
             cv2.imshow(WIN_NAME, frame)
-            key = cv2.waitKey(1) & 0xFF
-            if key in (ord("q"), 27):
+            k = cv2.waitKey(1) & 0xFF
+            if k in (ord("q"), 27):
                 self._shutdown_requested = True
                 try:
                     rclpy.shutdown()
