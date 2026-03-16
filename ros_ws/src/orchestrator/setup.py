@@ -21,6 +21,7 @@ setup(
     entry_points={
         'console_scripts': [
             'orchestrator_node = orchestrator.orchestrator_node:main',
+            'motion_controller_node = orchestrator.motion_controller_node:main',
         ],
     },
 )
