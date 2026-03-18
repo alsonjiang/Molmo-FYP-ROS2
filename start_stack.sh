@@ -57,7 +57,7 @@ start_bg "moondream" "${LOG_DIR}/moondream.log" \
 # Wait until Moondream responds (with timeout)
 ############################################
 echo "Waiting for Moondream to load model..."
-deadline=$((SECONDS+180))  # 3 minutes
+deadline=$((SECONDS+180))
 until curl -sf "http://127.0.0.1:${MOONDREAM_PORT}/health" > /dev/null; do
   sleep 3
   echo "Moondream still loading..."
@@ -81,7 +81,7 @@ sleep 3
 free -h || true
 
 ############################################
-# Step 3 — ROS env
+# Step 3 — Source ROS environment
 ############################################
 echo "[3] Sourcing ROS workspace..."
 set +u
@@ -90,19 +90,33 @@ source "$REPO_DIR/ros_ws/install/setup.bash"
 set -u
 
 ############################################
-# Step 4 — Start Webcam
+# Step 4 — Start TurtleBot3 bringup
 ############################################
-echo "[4] Starting webcam..."
-# Force topic name so your pipeline is consistent
+echo "[4] Starting TurtleBot3 bringup..."
+export TURTLEBOT3_MODEL=burger
+export LDS_MODEL=LDS-01
+
+# Optional override: export OPENCR_PORT=/dev/ttyACM0 before running script
+OPENCR_PORT="${OPENCR_PORT:-/dev/ttyACM0}"
+
+start_bg "turtlebot3_bringup" "${LOG_DIR}/turtlebot3.log" \
+  ros2 launch turtlebot3_bringup robot.launch.py port:="${OPENCR_PORT}"
+
+sleep 6
+
+############################################
+# Step 5 — Start Webcam
+############################################
+echo "[5] Starting webcam..."
 start_bg "cam2image" "${LOG_DIR}/cam.log" \
   ros2 run image_tools cam2image --ros-args -r image:=/image
 
 sleep 2
 
 ############################################
-# Step 5 — Start YOLO adapter
+# Step 6 — Start YOLO adapter
 ############################################
-echo "[5] Starting YOLO ROS adapter..."
+echo "[6] Starting YOLO ROS adapter..."
 start_bg "yolo_adapter" "${LOG_DIR}/yolo_adapter.log" \
   ros2 run yolo_adapter yolo_node --ros-args \
     -p image_topic:=/image \
@@ -112,9 +126,9 @@ start_bg "yolo_adapter" "${LOG_DIR}/yolo_adapter.log" \
 sleep 2
 
 ############################################
-# Step 6 — Start Orchestrator
+# Step 7 — Start Orchestrator
 ############################################
-echo "[6] Starting Orchestrator..."
+echo "[7] Starting Orchestrator..."
 start_bg "orchestrator" "${LOG_DIR}/orchestrator.log" \
   ros2 run orchestrator orchestrator_node --ros-args \
     -p image_topic:=/image \
@@ -123,14 +137,25 @@ start_bg "orchestrator" "${LOG_DIR}/orchestrator.log" \
     -p moondream_hz:=1.0 \
     -p moondream_enabled:=true
 
+############################################
+# Step 8 — Start Motion Controller
+############################################
+echo "[8] Starting Motion Controller..."
+start_bg "motion_controller" "${LOG_DIR}/motion_controller.log" \
+  ros2 run orchestrator motion_controller_node
+
+sleep 2
+
 echo ""
 echo "===== STACK STARTED SUCCESSFULLY ====="
 echo ""
 echo "Logs:"
 echo "  tail -f /tmp/moondream.log"
 echo "  tail -f /tmp/yolo.log"
+echo "  tail -f /tmp/turtlebot3.log"
 echo "  tail -f /tmp/cam.log"
 echo "  tail -f /tmp/yolo_adapter.log"
 echo "  tail -f /tmp/orchestrator.log"
+echo "  tail -f /tmp/motion_controller.log"
 echo ""
 echo "PIDs saved in: ${PID_DIR}"
