@@ -3,6 +3,11 @@ ros_ws/build/
 ros_ws/install/
 ros_ws/log/
 
+#colcon artifacts
+build/
+install/
+log/
+
 # Python
 __pycache__/
 *.pyc
@@ -15,6 +20,7 @@ venv/
 .idea/
 
 # Data / models / logs
+weights/
 data/
 models/
 *.pt
@@ -24,5 +30,7 @@ models/
 *.safetensors
 *.bin
 
+
 # Misc
 *.log
+cusparselt-local-tegra-repo-ubuntu2204-0.8.1_0.8.1-1_arm64.deb
