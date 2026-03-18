@@ -29,8 +29,9 @@ models/
 *.engine
 *.safetensors
 *.bin
-
+*.engine
+*.plan
 
 # Misc
 *.log
-cusparselt-local-tegra-repo-ubuntu2204-0.8.1_0.8.1-1_arm64.deb
+*.deb
