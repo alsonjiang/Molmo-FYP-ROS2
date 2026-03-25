@@ -4,6 +4,8 @@ import json
 import threading
 from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple, Union, Dict
+from pathlib import Path
+from datetime import datetime, timezone
 
 import cv2
 import numpy as np
@@ -188,8 +190,8 @@ class Orchestrator(Node):
         self._vlm_lock = threading.Lock()
         self.last_call_t: float = 0.0
         self.last_state: str = "IDLE"
-        self.last_text: str = ""        # debug topic
-        self.last_text_ok: str = ""     # overlay text (sticky)
+        self.last_text: str = ""
+        self.last_text_ok: str = ""
         self.last_ms: Optional[float] = None
 
         self._shutdown_requested = False
@@ -208,6 +210,12 @@ class Orchestrator(Node):
         # terminal print throttling
         self._last_printed_text: str = ""
         self._last_print_t: float = 0.0
+
+        # ---------------- Latency logging ----------------
+        run_name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        self.run_dir = Path.home() / "molmo_fyp_ros" / "data" / "latency" / run_name
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self.log_path = self.run_dir / "latency.jsonl"
 
         # ---------------- Window Setup (ONCE) ----------------
         if self.show_window:
@@ -238,6 +246,29 @@ class Orchestrator(Node):
         self.get_logger().info(f"  image_topic: {self.image_topic}")
         self.get_logger().info(f"  det_topic  : {self.det_topic}")
         self.get_logger().info(f"  vlm_url    : {self.vlm_url} (enabled={self.vlm_enabled})")
+        self.get_logger().info(f"  log_path   : {self.log_path}")
+
+    # ---------------- Logging ----------------
+    def _append_latency_log(
+        self,
+        status: str,
+        lat_total_ms: float,
+        lat_encode_ms: Optional[float],
+        lat_vlm_ms: Optional[float],
+        caption: str = "",
+        error: str = "",
+    ) -> None:
+        record = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "status": status,
+            "lat_total_ms": round(lat_total_ms, 2),
+            "lat_encode_ms": None if lat_encode_ms is None else round(lat_encode_ms, 2),
+            "lat_vlm_ms": None if lat_vlm_ms is None else round(lat_vlm_ms, 2),
+            "caption": caption,
+            "error": error,
+        }
+        with open(self.log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     # ---------------- Shutdown ----------------
     def _on_ros_shutdown(self) -> None:
@@ -350,7 +381,6 @@ class Orchestrator(Node):
         thickness = 2
         line_h = 20
 
-        # Measure panel size
         widths = []
         for ln in lines:
             (tw, th), base = cv2.getTextSize(ln, font, scale, thickness)
@@ -358,12 +388,10 @@ class Orchestrator(Node):
         panel_w = max(widths) + 16
         panel_h = len(lines) * line_h + 12
 
-        # Background rectangle (solid) to prevent “ghosting/flicker” look
         x2 = min(frame.shape[1] - 1, x + panel_w)
         y2 = min(frame.shape[0] - 1, y + panel_h)
         cv2.rectangle(frame, (x, y), (x2, y2), (0, 0, 0), -1)
 
-        # Draw lines
         yy = y + 22
         for ln in lines:
             cv2.putText(frame, ln, (x + 8, yy), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
@@ -376,15 +404,22 @@ class Orchestrator(Node):
             (tw, th), base = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
             y_text = max(0, d.y1 - th - base - 6)
             cv2.rectangle(frame, (d.x1, y_text), (d.x1 + tw + 10, y_text + th + base + 10), (0, 255, 0), -1)
-            cv2.putText(frame, label, (d.x1 + 5, y_text + th + 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2, cv2.LINE_AA)
+            cv2.putText(
+                frame,
+                label,
+                (d.x1 + 5, y_text + th + 5),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 0, 0),
+                2,
+                cv2.LINE_AA,
+            )
 
         with self._vlm_lock:
             state = self.last_state
             ms = self.last_ms
-            caption = self.last_text_ok  # sticky caption only (stable)
+            caption = self.last_text_ok
 
-        # Build panel lines (status always shown; caption shown if we have one)
         status = f"vlm: {state}"
         if ms is not None:
             status += f" {ms:.0f}ms"
@@ -393,7 +428,6 @@ class Orchestrator(Node):
         if caption:
             lines += self._wrap_lines(caption, max_chars=80, max_lines=4)
 
-        # Optionally hide status during pending (caption stays)
         if not self.overlay_show_pending and state.startswith("PENDING"):
             lines = self._wrap_lines(caption, max_chars=80, max_lines=4)
 
@@ -475,6 +509,7 @@ class Orchestrator(Node):
         self._last_print_t = now
         self.get_logger().info(f"[VLM] {t}")
 
+    # ---------------- Worker ----------------
     def _vlm_worker(self) -> None:
         session = requests.Session()
 
@@ -495,18 +530,24 @@ class Orchestrator(Node):
                 continue
             self._inflight = True
 
-            # IMPORTANT: do NOT blank last_text_ok (sticky caption)
             with self._vlm_lock:
                 self.last_call_t = time.time()
                 self.last_state = "PENDING"
-                self.last_text = ""   # debug can be blank
+                self.last_text = ""
                 self.last_ms = None
             self._publish_vlm_debug("PENDING", "", None)
 
-            t0 = time.time()
+            t0 = time.perf_counter()
+            lat_encode_ms = None
+            lat_vlm_ms = None
+
             try:
                 crop = resize_max_width(crop, self.max_crop_width)
+
+                t1 = time.perf_counter()
                 jpeg_bytes = bgr_to_jpeg_bytes(crop, quality=self.jpeg_quality)
+                t2 = time.perf_counter()
+                lat_encode_ms = (t2 - t1) * 1000.0
 
                 files = {"image": ("crop.jpg", jpeg_bytes, "image/jpeg")}
                 data = {
@@ -515,8 +556,12 @@ class Orchestrator(Node):
                     "temperature": str(self.vlm_temperature),
                 }
 
+                t3 = time.perf_counter()
                 r = session.post(self.vlm_url, files=files, data=data, timeout=self.vlm_timeout_s)
-                ms = (time.time() - t0) * 1000.0
+                t4 = time.perf_counter()
+
+                lat_vlm_ms = (t4 - t3) * 1000.0
+                lat_total_ms = (t4 - t0) * 1000.0
 
                 if r.status_code != 200:
                     text = (r.text or "").strip()[:600]
@@ -524,8 +569,16 @@ class Orchestrator(Node):
                     with self._vlm_lock:
                         self.last_state = state
                         self.last_text = text
-                        self.last_ms = ms
-                    self._publish_vlm_debug(state, text, ms)
+                        self.last_ms = lat_total_ms
+                    self._publish_vlm_debug(state, text, lat_total_ms)
+                    self._append_latency_log(
+                        status=state,
+                        lat_total_ms=lat_total_ms,
+                        lat_encode_ms=lat_encode_ms,
+                        lat_vlm_ms=lat_vlm_ms,
+                        caption="",
+                        error=text,
+                    )
                     continue
 
                 try:
@@ -535,8 +588,16 @@ class Orchestrator(Node):
                     with self._vlm_lock:
                         self.last_state = "JSON_ERROR"
                         self.last_text = text[:600]
-                        self.last_ms = ms
-                    self._publish_vlm_debug("JSON_ERROR", text[:600], ms)
+                        self.last_ms = lat_total_ms
+                    self._publish_vlm_debug("JSON_ERROR", text[:600], lat_total_ms)
+                    self._append_latency_log(
+                        status="JSON_ERROR",
+                        lat_total_ms=lat_total_ms,
+                        lat_encode_ms=lat_encode_ms,
+                        lat_vlm_ms=lat_vlm_ms,
+                        caption="",
+                        error=text[:600],
+                    )
                     continue
 
                 text = str(j.get("text", j.get("caption", "")))[:600].strip()
@@ -544,31 +605,57 @@ class Orchestrator(Node):
                 with self._vlm_lock:
                     self.last_state = "OK"
                     self.last_text = text
-                    # CRITICAL: only update sticky caption if non-empty
                     if text:
                         self.last_text_ok = text
-                    self.last_ms = ms
-                self._publish_vlm_debug("OK", text, ms)
+                    self.last_ms = lat_total_ms
+                self._publish_vlm_debug("OK", text, lat_total_ms)
+
+                self._append_latency_log(
+                    status="OK",
+                    lat_total_ms=lat_total_ms,
+                    lat_encode_ms=lat_encode_ms,
+                    lat_vlm_ms=lat_vlm_ms,
+                    caption=text,
+                    error="",
+                )
 
                 if text:
                     self._maybe_print_caption(text)
 
             except requests.Timeout:
-                ms = (time.time() - t0) * 1000.0
+                t_end = time.perf_counter()
+                lat_total_ms = (t_end - t0) * 1000.0
                 with self._vlm_lock:
                     self.last_state = "TIMEOUT"
                     self.last_text = ""
-                    self.last_ms = ms
-                self._publish_vlm_debug("TIMEOUT", "", ms)
+                    self.last_ms = lat_total_ms
+                self._publish_vlm_debug("TIMEOUT", "", lat_total_ms)
+                self._append_latency_log(
+                    status="TIMEOUT",
+                    lat_total_ms=lat_total_ms,
+                    lat_encode_ms=lat_encode_ms,
+                    lat_vlm_ms=None,
+                    caption="",
+                    error="request timeout",
+                )
 
             except Exception as e:
-                ms = (time.time() - t0) * 1000.0
+                t_end = time.perf_counter()
+                lat_total_ms = (t_end - t0) * 1000.0
                 text = str(e)[:600]
                 with self._vlm_lock:
                     self.last_state = "ERROR"
                     self.last_text = text
-                    self.last_ms = ms
-                self._publish_vlm_debug("ERROR", text, ms)
+                    self.last_ms = lat_total_ms
+                self._publish_vlm_debug("ERROR", text, lat_total_ms)
+                self._append_latency_log(
+                    status="ERROR",
+                    lat_total_ms=lat_total_ms,
+                    lat_encode_ms=lat_encode_ms,
+                    lat_vlm_ms=lat_vlm_ms,
+                    caption="",
+                    error=text,
+                )
 
             finally:
                 self._inflight = False
@@ -587,10 +674,10 @@ class Orchestrator(Node):
             stable_ok, key = self._update_stable_target(best)
 
             can_call = (
-                stable_ok and
-                self.should_call_vlm_global() and
-                self._target_off_cooldown(key) and
-                (not self._inflight)
+                stable_ok
+                and self.should_call_vlm_global()
+                and self._target_off_cooldown(key)
+                and (not self._inflight)
             )
 
             if can_call:
