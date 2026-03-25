@@ -145,3 +145,10 @@ tail -f /tmp/yolo.log
 tail -f /tmp/moondream.log
 ```
 
+To view latency logs, use the following command
+```bash
+tail ~/molmo_fyp_ros/data/latency/*/latency.jsonl
+```
+These logs are also saved in /data
+
+
